@@ -1,0 +1,22 @@
+# Datasets
+datasets/
+*.mat
+
+# Cache
+.cache/
+*.pt
+*.pth
+
+# Results
+results/
+
+# Generated files
+*.npz
+*.npy
+*.csv
+*.png
+*.log
+
+# Python
+__pycache__/
+*.pyc
