@@ -6,7 +6,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+# Global caches for diagonal and anti-diagonal flat indices
+_diag_flat_idx_cache = {}
+_anti_diag_flat_idx_cache = {}
 # -------------------------------------------------------------------------
 # Directional Scan Helpers
 # -------------------------------------------------------------------------
@@ -59,16 +61,36 @@ def column_reconstruct(seq: torch.Tensor, H: int, W: int) -> torch.Tensor:
 
 
 
+def diagonal_scan(x: torch.Tensor) -> torch.Tensor:
+    """
+    Flattens spatial representation along diagonals.
+    Shape: (B, C, H, W) -> (B, H * W, C)
+    """
+    B, C, H, W = x.shape
+    key = (H, W, x.device) # or (H, W, seq.device) in reconstruct
+
+    if key not in _diag_flat_idx_cache:
+        indices = get_diagonal_indices(H, W)
+        _diag_flat_idx_cache[key] = torch.tensor(indices, device=x.device)
+    
+    idx_map = _diag_flat_idx_cache[key]
+    out = x[:, :, idx_map[:, 0], idx_map[:, 1]]
+    return out.permute(0, 2, 1)
+
 def diagonal_reconstruct(seq: torch.Tensor, H: int, W: int) -> torch.Tensor:
     """
     Rebuilds spatial map from diagonal sequence.
     Shape: (B, H * W, C) -> (B, C, H, W)
     """
     B, L, C = seq.shape
-    indices = get_diagonal_indices(H, W)
+    key = (H, W)
+    if key not in _diag_flat_idx_cache:
+        indices = get_diagonal_indices(H, W)
+        _diag_flat_idx_cache[key] = torch.tensor(indices, device=seq.device)
+    
+    idx_map = _diag_flat_idx_cache[key]
     out = torch.zeros(B, H, W, C, device=seq.device, dtype=seq.dtype)
-    for idx, (r, c) in enumerate(indices):
-        out[:, r, c, :] = seq[:, idx, :]
+    out[:, idx_map[:, 0], idx_map[:, 1], :] = seq
     return out.permute(0, 3, 1, 2)
 
 
@@ -76,11 +98,13 @@ def anti_diagonal_scan(x: torch.Tensor) -> torch.Tensor:
     """Flattens spatial representation along anti-diagonals."""
     B, C, H, W = x.shape
     x_flipped = torch.flip(x, dims=[3])
-    indices = get_diagonal_indices(H, W)
-    out = []
-    for r, c in indices:
-        out.append(x_flipped[:, :, r, c])
-    return torch.stack(out, dim=1)
+    key = (H, W)
+    if key not in _diag_flat_idx_cache:
+        indices = get_diagonal_indices(H, W)
+        _diag_flat_idx_cache[key] = torch.tensor(indices, device=x.device)
+    idx_map = _diag_flat_idx_cache[key]
+    out = x_flipped[:, :, idx_map[:, 0], idx_map[:, 1]]
+    return out.permute(0, 2, 1)
 
 
 def anti_diagonal_reconstruct(seq: torch.Tensor, H: int, W: int) -> torch.Tensor:
@@ -116,6 +140,8 @@ class SharedBiMamba(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         
     def forward_ssm(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.float()
         B, L, D = x.shape
         N = self.d_state
         
@@ -123,9 +149,9 @@ class SharedBiMamba(nn.Module):
         B_param, C_param, dt = torch.split(x_proj_out, [N, N, D], dim=-1)
         
         dt = F.softplus(self.dt_proj(dt))  # (B, L, D)
-        A = -torch.exp(self.A)             # (D, N)
+        A = -torch.exp(self.A.float())     # (D, N)
         
-        h = torch.zeros(B, D, N, device=x.device, dtype=x.dtype)
+        h = torch.zeros(B, D, N, device=x.device, dtype=torch.float32)
         ys = []
         for t in range(L):
             delta_t = dt[:, t, :].unsqueeze(-1)              # (B, D, 1)
@@ -136,8 +162,8 @@ class SharedBiMamba(nn.Module):
             ys.append(y_t)
             
         y = torch.stack(ys, dim=1)  # (B, L, D)
-        y = y + x * self.D.unsqueeze(0).unsqueeze(0)
-        return y
+        y = y + x * self.D.unsqueeze(0).unsqueeze(0).float()
+        return y.to(orig_dtype)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         proj = self.in_proj(x)
@@ -223,24 +249,39 @@ class ADAM(nn.Module):
 # -------------------------------------------------------------------------
 class GCDMF(nn.Module):
     """
-    Fuses the original CNN features and the Direction-Aware Mamba features (ADAM)
-    using a joint Mamba fusion block and a residual connection.
+    Global-Context Directional Mamba Fusion (GC-DMF) as described in the AMMP-Net paper.
+    It concatenates the four directional sequences, processes them with a shared BiMamba,
+    splits the output back into four directional features, then averages them.
     """
     def __init__(self, d_model: int, d_state: int = 16):
         super().__init__()
         self.fusion_mamba = SharedBiMamba(d_model, d_state)
-        self.proj = nn.Conv2d(d_model * 2, d_model, kernel_size=1)
+        # Optional projection to ensure input dimension matches d_model
+        self.proj = nn.Conv2d(d_model, d_model, kernel_size=1)
         
     def forward(self, spatial_feat: torch.Tensor, directional_feat: torch.Tensor) -> torch.Tensor:
-        concat_feat = torch.cat([spatial_feat, directional_feat], dim=1)  # (B, 2*D, H, W)
-        reduced_feat = self.proj(concat_feat)                            # (B, D, H, W)
-        
-        B, D, H, W = reduced_feat.shape
-        seq = row_scan(reduced_feat)
-        
-        fused_seq = self.fusion_mamba(seq)
-        
-        fused_feat = row_reconstruct(fused_seq, H, W)
+        # Project spatial features to match d_model if needed
+        proj_feat = self.proj(spatial_feat)  # (B, D, H, W)
+        B, D, H, W = proj_feat.shape
+        # Obtain four directional scans of the projected CNN features
+        s_row = row_scan(proj_feat)          # (B, L, D)
+        s_col = column_scan(proj_feat)       # (B, L, D)
+        s_diag = diagonal_scan(proj_feat)    # (B, L, D)
+        s_anti = anti_diagonal_scan(proj_feat)  # (B, L, D)
+        # Concatenate sequences along the sequence dimension
+        concat_seq = torch.cat([s_row, s_col, s_diag, s_anti], dim=1)  # (B, 4*L, D)
+        # Apply shared bidirectional Mamba
+        fused_seq = self.fusion_mamba(concat_seq)  # (B, 4*L, D)
+        # Split back into four directional feature sequences
+        f_row, f_col, f_diag, f_anti = torch.chunk(fused_seq, 4, dim=1)
+        # Reconstruct spatial maps for each direction
+        h_row = row_reconstruct(f_row, H, W)
+        h_col = column_reconstruct(f_col, H, W)
+        h_diag = diagonal_reconstruct(f_diag, H, W)
+        h_anti = anti_diagonal_reconstruct(f_anti, H, W)
+        # Average the four directional features
+        fused_feat = (h_row + h_col + h_diag + h_anti) / 4.0
+        # Residual connection with the original ADAM (directional) features
         return fused_feat + directional_feat
 
 

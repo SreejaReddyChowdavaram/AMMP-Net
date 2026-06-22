@@ -64,12 +64,18 @@ class MultiLevelMMDLoss(nn.Module):
         YX = K[bs:, :bs]
         return (XX + YY - XY - YX).mean()
         
-    def forward(self, fcnn_s, fadam_s, ffusion_s, fcnn_t, fadam_t, ffusion_t):
+    def forward(self, fcnn_s, fadam_s, ffusion_s,
+            fcnn_t, fadam_t, ffusion_t):
+
         mmd_cnn = self.mmd(fcnn_s, fcnn_t)
         mmd_adam = self.mmd(fadam_s, fadam_t)
         mmd_fusion = self.mmd(ffusion_s, ffusion_t)
-        return mmd_cnn + mmd_adam + mmd_fusion
 
+        return (
+            0.1 * mmd_cnn +
+            0.3 * mmd_adam +
+            1.0 * mmd_fusion
+        )
 
 # -------------------------------------------------------------------------
 # Prototype Alignment Loss
@@ -78,27 +84,38 @@ class PrototypeAlignmentLoss(nn.Module):
     def forward(self, feats_s, labels_s, feats_t, labels_t, weights_t, bank: MomentumPrototypeBank) -> torch.Tensor:
         loss = torch.tensor(0.0, device=feats_s.device)
         count = 0
-        
         for c in range(bank.num_classes):
             mask_s = (labels_s == c)
-            if mask_s.sum() > 0 and bank.tgt_initialized[c]:
-                loss += F.mse_loss(feats_s[mask_s], bank.tgt_prototypes[c].unsqueeze(0).expand(mask_s.sum(), -1))
-                count += 1
-                
-        for c in range(bank.num_classes):
             mask_t = (labels_t == c) & (weights_t > 0.5)
-            if mask_t.sum() > 0 and bank.src_initialized[c]:
-                loss += F.mse_loss(feats_t[mask_t], bank.src_prototypes[c].unsqueeze(0).expand(mask_t.sum(), -1))
-                count += 1
+            
+            if mask_s.sum() > 0:
+                src_proto = feats_s[mask_s].mean(dim=0)
+            elif bank.src_initialized[c]:
+                src_proto = bank.src_prototypes[c]
+            else:
+                continue
                 
+            if mask_t.sum() > 0:
+                denom = weights_t[mask_t].sum()
+                if denom > 1e-5:
+                    tgt_proto = (feats_t * weights_t.unsqueeze(1))[mask_t].sum(dim=0) / denom
+                else:
+                    tgt_proto = bank.tgt_prototypes[c]
+            elif bank.tgt_initialized[c]:
+                tgt_proto = bank.tgt_prototypes[c]
+            else:
+                continue
+                
+            # L2 normalise to project features onto a unit hypersphere (cosine metric alignment)
+            src_proto = F.normalize(src_proto, p=2, dim=0)
+            tgt_proto = F.normalize(tgt_proto, p=2, dim=0)
+            loss += torch.norm(src_proto - tgt_proto, p=2) ** 2
+            count += 1
+            
         if count > 0:
             return loss / count
         return loss
 
-
-# -------------------------------------------------------------------------
-# Prototype Separation Loss
-# -------------------------------------------------------------------------
 class PrototypeSeparationLoss(nn.Module):
     def __init__(self, margin: float = 1.0):
         super().__init__()
@@ -108,12 +125,18 @@ class PrototypeSeparationLoss(nn.Module):
         loss = torch.tensor(0.0, device=feats_s.device)
         count = 0
         
+        # Normalize representations and bank prototypes
+        src_protos_norm = F.normalize(bank.src_prototypes, p=2, dim=1)
+        tgt_protos_norm = F.normalize(bank.tgt_prototypes, p=2, dim=1)
+        feats_s_norm = F.normalize(feats_s, p=2, dim=1)
+        feats_t_norm = F.normalize(feats_t, p=2, dim=1)
+        
         for c in range(bank.num_classes):
             mask_s = (labels_s == c)
             if mask_s.sum() > 0:
                 for j in range(bank.num_classes):
                     if j != c and bank.tgt_initialized[j]:
-                        dist = torch.norm(feats_s[mask_s] - bank.tgt_prototypes[j].unsqueeze(0), p=2, dim=1)
+                        dist = torch.norm(feats_s_norm[mask_s] - tgt_protos_norm[j].unsqueeze(0), p=2, dim=1)
                         loss += torch.clamp(self.margin - dist, min=0.0).pow(2).mean()
                         count += 1
                         
@@ -122,14 +145,13 @@ class PrototypeSeparationLoss(nn.Module):
             if mask_t.sum() > 0:
                 for j in range(bank.num_classes):
                     if j != c and bank.src_initialized[j]:
-                        dist = torch.norm(feats_t[mask_t] - bank.src_prototypes[j].unsqueeze(0), p=2, dim=1)
+                        dist = torch.norm(feats_t_norm[mask_t] - src_protos_norm[j].unsqueeze(0), p=2, dim=1)
                         loss += torch.clamp(self.margin - dist, min=0.0).pow(2).mean()
                         count += 1
                         
         if count > 0:
             return loss / count
         return loss
-
 
 # -------------------------------------------------------------------------
 # Reliability-Aware DMSL
@@ -141,26 +163,31 @@ class ReliabilityAwareDMSL(nn.Module):
         
     def forward(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor,
                 weights: torch.Tensor) -> torch.Tensor:
+        # Pseudo labels from teacher predictions
+        pseudo = teacher_logits.argmax(dim=1)
+        ce_loss = F.cross_entropy(student_logits, pseudo, reduction="none")
+        weighted_ce = (ce_loss * weights).mean()
+        
+        # Softmax Probability KL distillation for stable gradients
         p_s = F.log_softmax(student_logits / self.temperature, dim=-1)
         p_t = F.softmax(teacher_logits / self.temperature, dim=-1)
-        kl = F.kl_div(p_s, p_t, reduction="none").sum(dim=-1) * (self.temperature ** 2)
-        return (kl * weights).mean()
+        consistency = F.kl_div(p_s, p_t, reduction="batchmean") * (self.temperature ** 2)
+        return weighted_ce + consistency
 
 
 # -------------------------------------------------------------------------
 # Prediction Reliability and Entropy Filtering Utilities
 # -------------------------------------------------------------------------
-def compute_reliability_weights(logits: torch.Tensor) -> tuple:
+def compute_reliability_weights(logits: torch.Tensor, tau: float = 0.3) -> tuple:
+    """Compute reliability weights based on confidence.
+    w_i = sigmoid(beta * (p_i - tau)) where p_i = max class probability.
+    """
     probs = F.softmax(logits, dim=-1)
-    entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
-    
-    C = logits.size(-1)
-    max_entropy = math.log(C) if C > 1 else 1.0
-    norm_entropy = (entropy / max_entropy).clamp(0.0, 1.0)
-    
-    weights = torch.sigmoid(5.0 * (0.5 - norm_entropy))
+    confidence, _ = probs.max(dim=-1)
+    beta = 20.0
+    weights = torch.sigmoid(beta * (confidence - tau))
     pseudo = probs.argmax(dim=-1)
-    return probs, weights, pseudo, norm_entropy
+    return probs, weights, pseudo, confidence
 
 
 def sharpen(probs: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
@@ -176,70 +203,181 @@ def sharpen(probs: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
 class AMMPNetLossEvaluator(nn.Module):
     def __init__(self, num_classes: int, feature_dim: int, cfg: dict):
         super().__init__()
+
         self.num_classes = num_classes
         self.feature_dim = feature_dim
-        
-        self.cls_loss_fn = ClassificationLoss(gamma=2.0)
+
+        self.cls_loss_fn = ClassificationLoss(gamma=0.0)
         self.mgda_loss_fn = MultiLevelMMDLoss()
         self.align_loss_fn = PrototypeAlignmentLoss()
         self.sep_loss_fn = PrototypeSeparationLoss(margin=1.0)
         self.dmsl_loss_fn = ReliabilityAwareDMSL(temperature=2.0)
-        
+
         self.lambda_cls = cfg.get("lambda_cls", 1.0)
         self.lambda_mgda = cfg.get("lambda_mgda", 0.2)
         self.lambda_align = cfg.get("lambda_align", 0.5)
         self.lambda_sep = cfg.get("lambda_sep", 0.05)
         self.lambda_dmsl = cfg.get("lambda_dmsl", 1.0)
-        
-    def forward(self, logits_s, y_s,
-                fcnn_s, fadam_s, ffusion_s,
-                logits_t, fcnn_t, fadam_t, ffusion_t,
-                logits_t_teach, ffusion_t_teach,
-                prototype_bank,
-                use_mgda: bool = True,
-                use_mpam: bool = True,
-                use_sep: bool = True,
-                use_dmsl: bool = True) -> tuple:
-        
+
+    def forward(
+        self,
+        logits_s,
+        y_s,
+        fcnn_s,
+        fadam_s,
+        ffusion_s,
+        logits_t,
+        fcnn_t,
+        fadam_t,
+        ffusion_t,
+        logits_t_teach,
+        ffusion_t_teach,
+        prototype_bank,
+        use_mgda=True,
+        use_mpam=True,
+        use_sep=True,
+        use_dmsl=True,
+        tau=0.7,
+    ):
+
+        # -----------------------------
+        # Classification Loss
+        # -----------------------------
         l_cls = self.cls_loss_fn(logits_s, y_s)
-        
+
+        # -----------------------------
+        # MMD Loss
+        # -----------------------------
         l_mgda = torch.tensor(0.0, device=logits_s.device)
+
         if use_mgda:
-            l_mgda = self.mgda_loss_fn(fcnn_s, fadam_s, ffusion_s, fcnn_t, fadam_t, ffusion_t)
-            
-        _, w_t, pseudo_t, _ = compute_reliability_weights(logits_t_teach)
-        
-        if use_mpam:
-            prototype_bank.update(ffusion_s, y_s, domain="source")
-            high_rel_mask = (w_t > 0.5)
-            if high_rel_mask.any():
-                prototype_bank.update(ffusion_t[high_rel_mask], pseudo_t[high_rel_mask], domain="target")
-                
+            l_mgda = self.mgda_loss_fn(
+                fcnn_s,
+                fadam_s,
+                ffusion_s,
+                fcnn_t,
+                fadam_t,
+                ffusion_t,
+            )
+
+        # -----------------------------
+        # Reliability Estimation
+        # -----------------------------
+        if use_mpam or use_dmsl:
+
+            _, w_t, pseudo_t, confidence = compute_reliability_weights(
+                logits_t_teach,
+                tau=tau,
+            )
+
+            pass
+
+        else:
+
+            batch_size = logits_t.shape[0]
+
+            w_t = torch.zeros(
+                batch_size,
+                device=logits_t.device,
+            )
+
+            pseudo_t = torch.zeros(
+                batch_size,
+                dtype=torch.long,
+                device=logits_t.device,
+            )
+
+            confidence = torch.zeros(
+                batch_size,
+                device=logits_t.device,
+            )
+
+        # -----------------------------
+        # Prototype Alignment
+        # -----------------------------
         l_align = torch.tensor(0.0, device=logits_s.device)
         l_sep = torch.tensor(0.0, device=logits_s.device)
+
         if use_mpam:
-            l_align = self.align_loss_fn(ffusion_s, y_s, ffusion_t, pseudo_t, w_t, prototype_bank)
+
+            prototype_bank.update(
+                ffusion_s,
+                y_s,
+                domain="source",
+            )
+
+            k = max(1, int(0.3 * confidence.shape[0]))
+
+            _, idx = torch.topk(confidence, k)
+
+            high_rel_mask = torch.zeros_like(
+                confidence,
+                dtype=torch.bool,
+            )
+
+            high_rel_mask[idx] = True
+
+            pass
+
+            if high_rel_mask.any():
+
+                prototype_bank.update(
+                    ffusion_t[high_rel_mask],
+                    pseudo_t[high_rel_mask],
+                    domain="target",
+                )
+
+            l_align = self.align_loss_fn(
+                ffusion_s,
+                y_s,
+                ffusion_t,
+                pseudo_t,
+                w_t,
+                prototype_bank,
+            )
+
             if use_sep:
-                l_sep = self.sep_loss_fn(ffusion_s, y_s, ffusion_t, pseudo_t, w_t, prototype_bank)
-                
+
+                l_sep = self.sep_loss_fn(
+                    ffusion_s,
+                    y_s,
+                    ffusion_t,
+                    pseudo_t,
+                    w_t,
+                    prototype_bank,
+                )
+
+        # -----------------------------
+        # DMSL
+        # -----------------------------
         l_dmsl = torch.tensor(0.0, device=logits_s.device)
+
         if use_dmsl:
-            l_dmsl = self.dmsl_loss_fn(logits_t, logits_t_teach, weights=w_t)
-            
+
+            l_dmsl = self.dmsl_loss_fn(
+                logits_t,
+                logits_t_teach,
+                weights=w_t,
+            )
+
+        # -----------------------------
+        # Total Loss
+        # -----------------------------
         loss = (
-            self.lambda_cls * l_cls +
-            self.lambda_mgda * l_mgda +
-            self.lambda_align * l_align +
-            self.lambda_dmsl * l_dmsl
+            self.lambda_cls * l_cls
+            + self.lambda_mgda * l_mgda
+            + self.lambda_align * l_align
+            + self.lambda_sep * l_sep
+            + self.lambda_dmsl * l_dmsl
         )
-        
+
         loss_dict = {
             "loss": loss.item(),
             "l_cls": l_cls.item(),
             "l_mgda": l_mgda.item(),
             "l_align": l_align.item(),
             "l_sep": l_sep.item(),
-            "l_dmsl": l_dmsl.item()
+            "l_dmsl": l_dmsl.item(),
         }
-        
+
         return loss, loss_dict

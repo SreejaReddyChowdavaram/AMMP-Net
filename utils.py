@@ -65,7 +65,6 @@ def save_config(config: dict, run_dir: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for k, v in sorted(config.items()):
             f.write(f"{k}: {v}\n")
-    print(f"[Logging] Saved configuration settings to {path}")
 
 
 # -------------------------------------------------------------------------
@@ -77,7 +76,6 @@ def save_predictions(predictions: np.ndarray, run_dir: str) -> None:
     """
     path = os.path.join(run_dir, "best_predictions.npz")
     np.savez_compressed(path, predictions=predictions)
-    print(f"[Logging] Saved model predictions to {path}")
 
 
 # -------------------------------------------------------------------------
@@ -137,7 +135,7 @@ def save_metrics(metrics: dict, run_dir: str, dataset_name: str, cfg: dict, dinf
             f.write(f"{row_str}\n")
         f.write("==================================================\n")
         
-    print(f"[Logging] Saved publication metrics report to {path}")
+    pass
 
 
 # -------------------------------------------------------------------------

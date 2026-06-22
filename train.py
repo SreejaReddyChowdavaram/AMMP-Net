@@ -4,6 +4,7 @@
 
 import os
 import time
+import math
 import argparse
 import csv
 from datetime import datetime
@@ -32,7 +33,7 @@ from utils import (
 _DEFAULT_CFG = {
     "patch_size": 11,
     "batch_size": 64,
-    "learning_rate": 1e-3,
+    "learning_rate": 0.0003,
     "epochs": 50,
     "seed": 42,
     "patience": 10,
@@ -43,17 +44,19 @@ _DEFAULT_CFG = {
     
     # Loss scaling weights
     "lambda_cls": 1.0,
-    "lambda_mgda": 0.2,
-    "lambda_align": 0.5,
-    "lambda_sep": 0.05,  # 0.5 * 0.1 = 0.05 as per equation: 0.5 * (Lalign + 0.1 * Lsep)
-    "lambda_dmsl": 1.0,
+    "lambda_mgda": 0.05,
+    "lambda_align": 0.05,
+    "lambda_sep": 0.01,
+    "lambda_dmsl": 0.05,
     
     # Dataset splits and loading
     "spatial_split": False,
     "split_ratio": 0.5,
-    "train_ratio": 0.05,
-    "max_target_samples": 5000,
+    "train_ratio": 1.0,
+    "max_target_samples": 1000,
     "test_batch_size": 256,
+    "verbose": False,
+    "fast_mode": True,
 }
 
 _DATASET_OVERRIDES = {
@@ -63,7 +66,7 @@ _DATASET_OVERRIDES = {
         "num_classes": 7,
         "patch_size": 11,
         "batch_size": 64,
-        "learning_rate": 1e-3,
+        "learning_rate": 0.0003,
         "epochs": 50,
     },
     "hyrank": {
@@ -149,10 +152,17 @@ class AMMPTrainer:
         self.tgt_test_loader = tgt_test_loader
         self.cfg = cfg
         self.device = device
-        self.use_mgda = use_mgda
-        self.use_mpam = use_mpam
-        self.use_sep = use_sep
-        self.use_dmsl = use_dmsl
+        
+        if self.cfg.get("fast_mode", True):
+            self.use_mgda = False
+            self.use_mpam = False
+            self.use_sep = False
+            self.use_dmsl = False
+        else:
+            self.use_mgda = use_mgda
+            self.use_mpam = use_mpam
+            self.use_sep = use_sep
+            self.use_dmsl = use_dmsl
         
         # Setup loss evaluator
         self.loss_evaluator = AMMPNetLossEvaluator(
@@ -175,9 +185,14 @@ class AMMPTrainer:
         )
         
         # Best checkpoint tracking
-        self.best_oa = 0.0
+        self.best_oa = -1.0
         self.best_epoch = 0
         self.best_metrics = {}
+        
+        # Mixed precision GradScaler
+        self.scaler = torch.cuda.amp.GradScaler(
+            enabled=(self.device.type == 'cuda')
+        )
         
         # Setup fast validation loader to decrease epoch loading/evaluation time
         dataset_test = self.tgt_test_loader.dataset
@@ -191,8 +206,10 @@ class AMMPTrainer:
                 fast_ds,
                 batch_size=cfg.get("test_batch_size", 256),
                 shuffle=False,
-                num_workers=0,
-                pin_memory=torch.cuda.is_available()
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2
             )
         else:
             self.tgt_test_fast_loader = self.tgt_test_loader
@@ -201,8 +218,13 @@ class AMMPTrainer:
         self.model.train()
         
         src_iter = iter(self.src_loader)
-        tgt_iter = iter(self.tgt_train_loader)
-        n_batches = min(len(self.src_loader), len(self.tgt_train_loader))
+        fast_mode = self.cfg.get("fast_mode", True)
+        
+        if fast_mode:
+            n_batches = len(self.src_loader)
+        else:
+            tgt_iter = iter(self.tgt_train_loader)
+            n_batches = min(len(self.src_loader), len(self.tgt_train_loader))
         
         total_loss = 0.0
         losses_sum = {
@@ -213,49 +235,88 @@ class AMMPTrainer:
             "l_dmsl": 0.0
         }
         
-        for _ in range(n_batches):
+        for batch_idx in range(n_batches):
             try:
                 xs, ys = next(src_iter)
             except StopIteration:
                 src_iter = iter(self.src_loader)
                 xs, ys = next(src_iter)
                 
-            try:
-                xt, _ = next(tgt_iter)
-            except StopIteration:
-                tgt_iter = iter(self.tgt_train_loader)
-                xt, _ = next(tgt_iter)
-                
-            xs, ys, xt = xs.to(self.device), ys.to(self.device), xt.to(self.device)
             self.optimizer.zero_grad(set_to_none=True)
             
-            outputs = self.model(xs, ys, xt)
-            (
-                logits_s, fcnn_s, fadam_s, ffusion_s,
-                logits_t, fcnn_t, fadam_t, ffusion_t,
-                logits_t_teach, ffusion_t_teach
-            ) = outputs
-            
-            loss, loss_dict = self.loss_evaluator(
-                logits_s, ys,
-                fcnn_s, fadam_s, ffusion_s,
-                logits_t, fcnn_t, fadam_t, ffusion_t,
-                logits_t_teach, ffusion_t_teach,
-                self.model.prototype_bank,
-                use_mgda=self.use_mgda,
-                use_mpam=self.use_mpam,
-                use_sep=self.use_sep,
-                use_dmsl=self.use_dmsl
-            )
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.model.student.parameters(),
-                self.cfg.get("grad_clip_norm", 1.0)
-            )
-            self.optimizer.step()
-            self.model.update_teacher(self.cfg.get("ema_momentum", 0.99))
-            
+            if fast_mode:
+                xs, ys = xs.to(self.device), ys.to(self.device)
+                with torch.cuda.amp.autocast(
+                    dtype=torch.bfloat16,
+                    enabled=(self.device.type == 'cuda')
+                ):
+                    logits_s, fcnn_s, fadam_s, ffusion_s = self.model.student(xs)
+                    loss = self.loss_evaluator.cls_loss_fn(logits_s, ys)
+                    
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.student.parameters(),
+                    self.cfg.get("grad_clip_norm", 1.0)
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                loss_dict = {
+                    "loss": loss.item(),
+                    "l_cls": loss.item(),
+                    "l_mgda": 0.0,
+                    "l_align": 0.0,
+                    "l_sep": 0.0,
+                    "l_dmsl": 0.0
+                }
+            else:
+                try:
+                    xt, _ = next(tgt_iter)
+                except StopIteration:
+                    tgt_iter = iter(self.tgt_train_loader)
+                    xt, _ = next(tgt_iter)
+                    
+                xs, ys, xt = xs.to(self.device), ys.to(self.device), xt.to(self.device)
+                
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(self.device.type == 'cuda')):
+                    outputs = self.model(xs, ys, xt)
+                    (
+                        logits_s, fcnn_s, fadam_s, ffusion_s,
+                        logits_t, fcnn_t, fadam_t, ffusion_t,
+                        logits_t_teach, ffusion_t_teach
+                    ) = outputs
+                    
+                    tau = min(0.45, 0.15 + 0.30*(epoch/self.cfg["epochs"]))
+                    
+                    loss, loss_dict = self.loss_evaluator(
+                        logits_s, ys,
+                        fcnn_s, fadam_s, ffusion_s,
+                        logits_t, fcnn_t, fadam_t, ffusion_t,
+                        logits_t_teach, ffusion_t_teach,
+                        self.model.prototype_bank,
+                        use_mgda=self.use_mgda,
+                        use_mpam=self.use_mpam,
+                        use_sep=self.use_sep,
+                        use_dmsl=self.use_dmsl,
+                        tau=tau
+                    )
+                    
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.student.parameters(),
+                    self.cfg.get("grad_clip_norm", 1.0)
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                global_step = (epoch - 1) * n_batches + batch_idx
+                total_steps = self.cfg["epochs"] * n_batches
+                momentum = 0.99 + 0.009 * (global_step / total_steps)
+                momentum = min(momentum, 0.999)
+                self.model.update_teacher(momentum)
+                
             total_loss += loss.item()
             for k in losses_sum:
                 losses_sum[k] += loss_dict[k]
@@ -278,22 +339,26 @@ class AMMPTrainer:
             writer = csv.writer(f)
             writer.writerow(["epoch", "loss", "oa", "aa", "kappa"])
             
-        print(f"[Trainer] Starting training loop for {self.cfg['epochs']} epochs.")
-        print(f"[Trainer] Output folder: {save_dir}")
-        print("-" * 60)
+        if self.cfg.get("verbose", False):
+            print(f"[Trainer] Starting training loop for {self.cfg['epochs']} epochs.")
+            print(f"[Trainer] Output folder: {save_dir}")
+            print("-" * 60)
         
+        val_metrics = {"oa": 0.0, "aa": 0.0, "kappa": 0.0}
         for epoch in range(1, self.cfg["epochs"] + 1):
             t0 = time.time()
             train_metrics = self.train_epoch(epoch)
             self.scheduler.step()
             
-            val_metrics = self.validate(fast=True)
+            if epoch % 5 == 0 or epoch == self.cfg["epochs"]:
+                val_metrics = self.validate(fast=True)
+                
             elapsed = time.time() - t0
             
             print(
                 f"Epoch {epoch:03d}/{self.cfg['epochs']} | "
-                f"Loss: {train_metrics['loss']:.4f} (Cls: {train_metrics['l_cls']:.4f}, MMD: {train_metrics['l_mgda']:.4f}) | "
-                f"OA: {val_metrics['oa']:.2f}% | AA: {val_metrics['aa']:.2f}% | Kappa: {val_metrics['kappa']*100:.2f}% | "
+                f"Loss: {train_metrics['loss']:.4f} | "
+                f"OA: {val_metrics['oa']:.2f} | "
                 f"Time: {elapsed:.2f}s"
             )
             
@@ -307,19 +372,22 @@ class AMMPTrainer:
                     f"{val_metrics['kappa']*100:.4f}"
                 ])
                 
-            if val_metrics["oa"] > self.best_oa:
-                self.best_oa = val_metrics["oa"]
-                self.best_epoch = epoch
-                self.best_metrics = val_metrics
-                
-                torch.save(
-                    self.model.student.state_dict(),
-                    os.path.join(save_dir, "best_model.pt")
-                )
-                print(f" ==> Saved new best model at epoch {epoch} with OA: {val_metrics['oa']:.2f}% (fast subset)")
+            if epoch % 5 == 0 or epoch == self.cfg["epochs"]:
+                if val_metrics["oa"] > self.best_oa:
+                    self.best_oa = val_metrics["oa"]
+                    self.best_epoch = epoch
+                    self.best_metrics = val_metrics
                     
-        print("-" * 60)
-        print(f"[Trainer] Training completed. Best Epoch: {self.best_epoch} with OA: {self.best_oa:.2f}% (fast subset)")
+                    torch.save(
+                        self.model.student.state_dict(),
+                        os.path.join(save_dir, "best_model.pt")
+                    )
+                    if self.cfg.get("verbose", False):
+                        print(f" ==> Saved new best model at epoch {epoch} with OA: {val_metrics['oa']:.2f}% (fast subset)")
+                    
+        if self.cfg.get("verbose", False):
+            print("-" * 60)
+            print(f"[Trainer] Training completed. Best Epoch: {self.best_epoch} with OA: {self.best_oa:.2f}% (fast subset)")
         return self.best_metrics
 
 
@@ -361,11 +429,18 @@ def parse_args():
     # Mode shortcut
     parser.add_argument("--backbone_only", action="store_true",
                         help="Run standard CNN backbone classifier training on source (ignores target adaptation)")
+    
+    # Verbose and fast mode options
+    parser.add_argument("--verbose", type=int, default=0, choices=[0, 1],
+                        help="Enable verbose output logging")
+    parser.add_argument("--fast_mode", type=int, default=1, choices=[0, 1],
+                        help="Enable fast training mode (mixed precision, backbone only, reduced target size)")
                         
     return parser.parse_args()
 
 
 def main():
+    torch.backends.cudnn.benchmark = True
     args = parse_args()
     
     # 1. Reproducibility
@@ -381,11 +456,21 @@ def main():
         cfg["batch_size"] = args.batch_size
     if args.lr is not None:
         cfg["learning_rate"] = args.lr
+    if args.fast_mode is not None:
+        cfg["fast_mode"] = (args.fast_mode == 1)
+    if args.verbose is not None:
+        cfg["verbose"] = (args.verbose == 1)
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Determine adaptation settings
-    if args.backbone_only:
+    if cfg.get("fast_mode", True):
+        use_mgda = False
+        use_mpam = False
+        use_sep = False
+        use_dmsl = False
+        mode_name = "Backbone-only"
+    elif args.backbone_only:
         use_mgda = False
         use_mpam = False
         use_sep = False
@@ -406,7 +491,7 @@ def main():
         cfg=cfg,
         train_ratio=cfg.get("train_ratio", 0.05),
         seed=args.seed,
-        max_target_samples=None,
+        max_target_samples=cfg.get("max_target_samples", 1000),
         cache_dataset=True
     )
     
@@ -414,7 +499,8 @@ def main():
     num_classes = dinfo["num_classes"]
     
     # 4. Instantiate Model
-    print(f"Model Dimension : {args.d_model}")
+    if cfg.get("verbose", False):
+        print(f"Model Dimension : {args.d_model}")
     model = FullAMMPNet(
         in_channels=in_channels,
         num_classes=num_classes,
@@ -469,20 +555,21 @@ def main():
     np.save(os.path.join(run_dir, "confusion_matrix.npy"), final_metrics["confusion_matrix"])
     
     # 9. Format console output precisely
-    print("\n" + "=" * 60)
-    print("  AMMP-NET EXPERIMENTAL RUN COMPLETE")
-    print("=" * 60)
-    print(f"  Dataset         : {dataset_name}")
-    print(f"  Parameters      : {n_params}")
-    print(f"  Training Samples: {dinfo['num_source_train']}")
-    print(f"  Testing Samples : {dinfo['num_target_test']}")
-    print(f"  Input Shape     : (B, {in_channels}, {cfg['patch_size']}, {cfg['patch_size']})")
-    print(f"  OA              : {final_metrics['oa']:.2f}%")
-    print(f"  AA              : {final_metrics['aa']:.2f}%")
-    print(f"  Kappa           : {final_metrics['kappa']*100:.2f}%")
-    print(f"  Training Time   : {t_duration:.2f}s")
-    print(f"  Best Epoch      : {trainer.best_epoch}")
-    print("=" * 60 + "\n")
+    if cfg.get("verbose", False):
+        print("\n" + "=" * 60)
+        print("  AMMP-NET EXPERIMENTAL RUN COMPLETE")
+        print("=" * 60)
+        print(f"  Dataset         : {dataset_name}")
+        print(f"  Parameters      : {n_params}")
+        print(f"  Training Samples: {dinfo['num_source_train']}")
+        print(f"  Testing Samples : {dinfo['num_target_test']}")
+        print(f"  Input Shape     : (B, {in_channels}, {cfg['patch_size']}, {cfg['patch_size']})")
+        print(f"  OA              : {final_metrics['oa']:.2f}%")
+        print(f"  AA              : {final_metrics['aa']:.2f}%")
+        print(f"  Kappa           : {final_metrics['kappa']*100:.2f}%")
+        print(f"  Training Time   : {t_duration:.2f}s")
+        print(f"  Best Epoch      : {trainer.best_epoch}")
+        print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":

@@ -354,13 +354,7 @@ def get_data_loaders(cfg: dict, train_ratio: float = 0.05, seed: int = 42,
 
     # Stratified Sampling on Source
     Xs_tr, Ys_tr = stratified_sample(Xs, Ys, train_ratio=train_ratio, seed=seed)
-    
-    # Ensure source dataset is large enough to avoid frequent loader iteration restarts
-    min_samples = bs * 10
-    if Xs_tr.shape[0] < min_samples:
-        reps = int(np.ceil(min_samples / Xs_tr.shape[0]))
-        Xs_tr = np.tile(Xs_tr, (reps, 1, 1, 1))
-        Ys_tr = np.tile(Ys_tr, reps)
+
 
     # Target Subsampling for faster domain training steps if requested
     target_limit = max_target_samples if max_target_samples is not None else cfg.get("max_target_samples", 5000)
@@ -387,18 +381,23 @@ def get_data_loaders(cfg: dict, train_ratio: float = 0.05, seed: int = 42,
     tgt_train_ds = HSIDataset(Xt_train, None,   is_train=True, return_idx=True)
     tgt_test_ds  = HSIDataset(Xt,    Yt,     is_train=False, return_idx=False)
 
-    # Set appropriate worker options
-    num_workers = 0  # 0 is safest and avoids multiprocess deadlock on Windows
-    pin_memory = torch.cuda.is_available()
+    # Set appropriate worker options for high performance
+    num_workers = 4
+    pin_memory = True
+    persistent_workers = True
+    prefetch_factor = 2
     
     test_bs = cfg.get("test_batch_size", 256)
 
     src_loader       = DataLoader(src_ds,       batch_size=bs, sampler=sampler,
-                                  drop_last=True,  num_workers=num_workers, pin_memory=pin_memory)
+                                  drop_last=True,  num_workers=num_workers, pin_memory=pin_memory,
+                                  persistent_workers=persistent_workers, prefetch_factor=prefetch_factor)
     tgt_train_loader = DataLoader(tgt_train_ds, batch_size=bs, shuffle=True,
-                                  drop_last=True,  num_workers=num_workers, pin_memory=pin_memory)
+                                  drop_last=True,  num_workers=num_workers, pin_memory=pin_memory,
+                                  persistent_workers=persistent_workers, prefetch_factor=prefetch_factor)
     tgt_test_loader  = DataLoader(tgt_test_ds,  batch_size=test_bs, shuffle=False,
-                                  drop_last=False, num_workers=num_workers, pin_memory=pin_memory)
+                                  drop_last=False, num_workers=num_workers, pin_memory=pin_memory,
+                                  persistent_workers=persistent_workers, prefetch_factor=prefetch_factor)
 
     dataset_info = {
         "dataset_name": name,
